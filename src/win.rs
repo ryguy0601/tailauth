@@ -538,10 +538,22 @@ unsafe extern "system" fn service_ctrl_handler(
     }
 }
 
+fn append_service_log(msg: &str) {
+    let ts = crate::store::now_unix_secs();
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\ProgramData\TailAuth\service.log")
+    {
+        let _ = writeln!(file, "[{ts}] {msg}");
+    }
+}
+
 unsafe extern "system" fn service_main(
     _argc: u32,
     _argv: *mut windows_sys::core::PWSTR,
 ) {
+    append_service_log("service_main entered");
     let svc_name = to_wide_null("TailAuth");
     let handle = RegisterServiceCtrlHandlerExW(
         svc_name.as_ptr(),
@@ -549,6 +561,10 @@ unsafe extern "system" fn service_main(
         std::ptr::null(),
     );
     if handle.is_null() {
+        append_service_log(&format!(
+            "RegisterServiceCtrlHandlerExW failed: {}",
+            io::Error::last_os_error()
+        ));
         return;
     }
 
@@ -558,6 +574,7 @@ unsafe extern "system" fn service_main(
     report_service_status(SERVICE_START_PENDING, 0, 3000);
 
     let Some(cfg) = SERVICE_CONFIG.get().cloned() else {
+        append_service_log("missing SERVICE_CONFIG");
         report_service_status(SERVICE_STOPPED, 1, 0);
         return;
     };
@@ -572,15 +589,26 @@ unsafe extern "system" fn service_main(
         .build()
     {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
+            append_service_log(&format!("tokio runtime error: {e}"));
             report_service_status(SERVICE_STOPPED, 1, 0);
             return;
         }
     };
 
     report_service_status(SERVICE_RUNNING, 0, 0);
+    append_service_log("service running");
     let res = rt.block_on(crate::daemon::run_daemon_with_shutdown(cfg, rx));
-    let exit_code = if res.is_ok() { 0 } else { 1 };
+    let exit_code = match res {
+        Ok(()) => {
+            append_service_log("service stopped cleanly");
+            0
+        }
+        Err(e) => {
+            append_service_log(&format!("daemon error: {e}"));
+            1
+        }
+    };
     report_service_status(SERVICE_STOPPED, exit_code, 0);
 }
 

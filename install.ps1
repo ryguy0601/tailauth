@@ -110,7 +110,7 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
 Write-Step "Securing $DataDir and writing config.json"
-& icacls $DataDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+& icacls $DataDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:RX" | Out-Null
 
 $cfgObj = [ordered]@{
     fqdn = $tsFqdn
@@ -122,8 +122,16 @@ $cfgObj = [ordered]@{
     allowed_tailscale_users = @($AllowTsUser)
 }
 $cfgJson = $cfgObj | ConvertTo-Json -Depth 4
-[System.IO.File]::WriteAllText("$DataDir\config.json", "$cfgJson`n", (New-Object System.Text.UTF8Encoding($false)))
-Write-Ok "Saved $DataDir\config.json"
+$cfgPath = Join-Path $DataDir "config.json"
+[System.IO.File]::WriteAllText($cfgPath, "$cfgJson`n", (New-Object System.Text.UTF8Encoding($false)))
+& icacls $cfgPath /grant:r "*S-1-5-32-545:R" | Out-Null
+
+$credPath = Join-Path $DataDir "credentials.json"
+if (-not (Test-Path $credPath)) {
+    [System.IO.File]::WriteAllText($credPath, "{}`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+& icacls $credPath /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+Write-Ok "Saved $cfgPath"
 
 Write-Step "Installing tailauth.exe and TailAuth Windows Service"
 $existingSvc = Get-Service -Name "TailAuth" -ErrorAction SilentlyContinue
@@ -133,7 +141,12 @@ if ($existingSvc) {
         Start-Sleep -Milliseconds 500
     }
     & sc.exe delete TailAuth | Out-Null
-    Start-Sleep -Milliseconds 500
+    for ($w = 0; $w -lt 20; $w++) {
+        if (-not (Get-Service -Name "TailAuth" -ErrorAction SilentlyContinue)) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
 }
 
 $destExe = Join-Path $InstallDir "tailauth.exe"
@@ -143,10 +156,13 @@ $tsudoCmd = "@`"$destExe`" sudo %*`r`n"
 [System.IO.File]::WriteAllText((Join-Path $InstallDir "tsudo.cmd"), $tsudoCmd, [System.Text.Encoding]::ASCII)
 
 $binPath = "`"$destExe`" service"
-& sc.exe create TailAuth binPath= $binPath start= auto DisplayName= "TailAuth Phone Fingerprint Service" | Out-Null
-& sc.exe description TailAuth "Tailnet WebAuthn phone-fingerprint elevation service for TailAuth." | Out-Null
+New-Service -Name "TailAuth" `
+    -BinaryPathName $binPath `
+    -DisplayName "TailAuth Phone Fingerprint Service" `
+    -Description "Tailnet WebAuthn phone-fingerprint elevation service for TailAuth." `
+    -StartupType Automatic | Out-Null
 & sc.exe failure TailAuth reset= 86400 actions= restart/2000/restart/2000/restart/5000 | Out-Null
-& sc.exe start TailAuth | Out-Null
+Start-Service -Name "TailAuth"
 Write-Ok "TailAuth Windows Service started"
 
 Write-Step "Configuring Tailscale Serve HTTPS proxy on port $Port"
@@ -170,6 +186,13 @@ for ($i = 0; $i -lt 15; $i++) {
     }
 }
 if (-not $healthy) {
+    $svcState = (Get-Service -Name "TailAuth" -ErrorAction SilentlyContinue).Status
+    Write-Warn "TailAuth service status: $svcState"
+    $svcLog = Join-Path $DataDir "service.log"
+    if (Test-Path $svcLog) {
+        Write-Host "--- $svcLog ---"
+        Get-Content -Tail 20 -Path $svcLog
+    }
     throw "Daemon health check failed on 127.0.0.1:${Port}"
 }
 Write-Ok "Daemon health endpoint OK"
