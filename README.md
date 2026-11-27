@@ -12,6 +12,10 @@ Cross-platform **Tailnet phone-fingerprint authentication** for **Linux `sudo`**
 
 </div>
 
+<p align="center">
+  <img src="demoPics/01-overview.png" alt="TailAuth Overview" width="100%" />
+</p>
+
 ---
 
 ## 🌟 Key Features
