@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>TailAuth — Approve Sudo</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --card: #131a26;
+      --border: #263248;
+      --text: #eef3fb;
+      --muted: #8fa1bf;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --ok: #22c55e;
+      --danger: #ef4444;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #172033 0%, var(--bg) 65%);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: rgba(59, 130, 246, 0.14);
+      padding: 6px 12px;
+      border-radius: 999px;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.25;
+    }
+    .subtitle {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.45;
+    }
+    .meta {
+      background: rgba(11, 15, 23, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 20px;
+    }
+    .meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 14px;
+    }
+    .meta-row + .meta-row {
+      border-top: 1px solid rgba(38, 50, 72, 0.65);
+    }
+    .meta-label { color: var(--muted); }
+    .meta-value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+      color: var(--text);
+      word-break: break-all;
+      text-align: right;
+      margin-left: 12px;
+    }
+    .status {
+      min-height: 24px;
+      margin-bottom: 16px;
+      font-size: 14px;
+      line-height: 1.45;
+      color: var(--muted);
+      text-align: center;
+    }
+    .status.ok { color: var(--ok); font-weight: 600; }
+    .status.err { color: var(--danger); font-weight: 600; }
+    .status.warn { color: var(--warn); }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 14px;
+      padding: 16px 18px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.08s ease, opacity 0.15s ease, background 0.15s ease;
+    }
+    button:active { transform: scale(0.985); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-deny {
+      background: rgba(239, 68, 68, 0.14);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+    }
+    .btn-deny:hover:not(:disabled) { background: rgba(239, 68, 68, 0.24); }
+    .done-icon {
+      font-size: 46px;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge">TailAuth • Tailnet WebAuthn</div>
+    <div id="doneIcon" class="done-icon hidden"></div>
+    <h1 id="title">Approve sudo request</h1>
+    <p class="subtitle" id="subtitle">Confirm with your phone fingerprint or biometrics.</p>
+
+    <div class="meta">
+      <div class="meta-row">
+        <span class="meta-label">Target</span>
+        <span class="meta-value" id="metaTarget">Loading…</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Service</span>
+        <span class="meta-value" id="metaService">—</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Expires in</span>
+        <span class="meta-value" id="metaTimer">—</span>
+      </div>
+    </div>
+
+    <div id="status" class="status">Preparing biometric challenge…</div>
+
+    <div class="actions" id="actions">
+      <button id="verifyBtn" class="btn-primary" disabled>Verify with Fingerprint</button>
+      <button id="denyBtn" class="btn-deny" disabled>Deny Request</button>
+    </div>
+  </main>
+
+  <script>
+    const token = window.location.pathname.split("/").filter(Boolean).pop();
+    const statusEl = document.getElementById("status");
+    const verifyBtn = document.getElementById("verifyBtn");
+    const denyBtn = document.getElementById("denyBtn");
+    const actionsEl = document.getElementById("actions");
+    const doneIconEl = document.getElementById("doneIcon");
+    const titleEl = document.getElementById("title");
+    const subtitleEl = document.getElementById("subtitle");
+    const metaTargetEl = document.getElementById("metaTarget");
+    const metaServiceEl = document.getElementById("metaService");
+    const metaTimerEl = document.getElementById("metaTimer");
+
+    let challengeData = null;
+    let remainingSecs = 0;
+    let timerHandle = null;
+    let finished = false;
+    let busy = false;
+
+    function b64urlToBuf(str) {
+      const pad = "=".repeat((4 - (str.length % 4)) % 4);
+      const b64 = (str + pad).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    function bufToB64url(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    }
+
+    function setStatus(msg, cls = "") {
+      statusEl.textContent = msg;
+      statusEl.className = "status" + (cls ? " " + cls : "");
+    }
+
+    function finishUI(ok, headline, sub, msg) {
+      finished = true;
+      if (timerHandle) clearInterval(timerHandle);
+      verifyBtn.disabled = true;
+      denyBtn.disabled = true;
+      actionsEl.classList.add("hidden");
+      doneIconEl.classList.remove("hidden");
+      doneIconEl.textContent = ok ? "✔" : "✖";
+      doneIconEl.style.color = ok ? "var(--ok)" : "var(--danger)";
+      titleEl.textContent = headline;
+      subtitleEl.textContent = sub;
+      setStatus(msg, ok ? "ok" : "err");
+    }
+
+    function startCountdown(secs) {
+      remainingSecs = Math.max(0, secs);
+      const render = () => {
+        metaTimerEl.textContent = remainingSecs + "s";
+        if (remainingSecs <= 0 && !finished) {
+          finishUI(false, "Request expired", "This approval link has timed out.", "Terminal fell back to password.");
+        }
+      };
+      render();
+      timerHandle = setInterval(() => {
+        if (remainingSecs > 0) remainingSecs -= 1;
+        render();
+      }, 1000);
+    }
+
+    async function triggerBiometric(isAuto = false) {
+      if (finished || busy || !challengeData) return;
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        setStatus("WebAuthn is not supported in this browser.", "err");
+        return;
+      }
+
+      busy = true;
+      verifyBtn.disabled = true;
+      setStatus("Waiting for phone fingerprint…");
+
+      try {
+        const assertion = await navigator.credentials.get({
+          publicKey: {
+            challenge: b64urlToBuf(challengeData.challenge),
+            rpId: challengeData.rp_id,
+            timeout: Math.max(15000, remainingSecs * 1000),
+            userVerification: "required",
+            allowCredentials: challengeData.allow_credentials.map((id) => ({
+              type: "public-key",
+              id: b64urlToBuf(id),
+              transports: ["internal", "hybrid"]
+            }))
+          }
+        });
+
+        setStatus("Verifying signature…");
+        const resp = await fetch(`/api/auth/${encodeURIComponent(token)}/verify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: assertion.id,
+            authenticatorData: bufToB64url(assertion.response.authenticatorData),
+            clientDataJSON: bufToB64url(assertion.response.clientDataJSON),
+            signature: bufToB64url(assertion.response.signature)
+          })
+        });
+
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(body.error || `Verification failed (${resp.status})`);
+        }
+
+        finishUI(
+          true,
+          "Approved",
+          `Authorized ${challengeData.user}@${challengeData.hostname}`,
+          "You can close this tab now."
+        );
+      } catch (err) {
+        if (err && (err.name === "NotAllowedError" || err.name === "AbortError")) {
+          setStatus(
+            isAuto
+              ? "Tap \"Verify with Fingerprint\" below to continue."
+              : "Biometric prompt dismissed. Tap below to try again.",
+            "warn"
+          );
+        } else {
+          setStatus(err.message || "Authentication error.", "err");
+        }
+      } finally {
+        busy = false;
+        if (!finished) verifyBtn.disabled = false;
+      }
+    }
+
+    async function denyRequest() {
+      if (finished || busy) return;
+      busy = true;
+      verifyBtn.disabled = true;
+      denyBtn.disabled = true;
+      try {
+        await fetch(`/api/auth/${encodeURIComponent(token)}/deny`, { method: "POST" });
+      } catch (_) {}
+      finishUI(false, "Request denied", "Access was rejected from your phone.", "Terminal fell back to password.");
+    }
+
+    async function init() {
+      try {
+        const resp = await fetch(`/api/auth/${encodeURIComponent(token)}/options`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          finishUI(
+            false,
+            "Request unavailable",
+            "This sudo prompt was cancelled or already used.",
+            data.error || "Session not found."
+          );
+          return;
+        }
+        challengeData = data;
+        metaTargetEl.textContent = `${data.user}@${data.hostname}`;
+        metaServiceEl.textContent = data.service || "sudo";
+        startCountdown(data.remaining_secs || 60);
+        verifyBtn.disabled = false;
+        denyBtn.disabled = false;
+        setStatus("Ready for fingerprint verification.");
+        // Attempt immediate biometric prompt; mobile browsers requiring a gesture fall back cleanly.
+        setTimeout(() => triggerBiometric(true), 120);
+      } catch (err) {
+        finishUI(false, "Connection error", "Could not reach TailAuth daemon.", err.message || "Network error");
+      }
+    }
+
+    verifyBtn.addEventListener("click", () => triggerBiometric(false));
+    denyBtn.addEventListener("click", denyRequest);
+    init();
+  </script>
+</body>
+</html>

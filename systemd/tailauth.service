@@ -1,0 +1,22 @@
+[Unit]
+Description=TailAuth — Tailnet phone-fingerprint sudo authentication daemon
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tailauth daemon
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=tailauth
+RuntimeDirectoryMode=0700
+StateDirectory=tailauth
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tailauth /run/tailauth
+
+[Install]
+WantedBy=multi-user.target

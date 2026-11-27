@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>TailAuth — Enroll Phone</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --card: #131a26;
+      --border: #263248;
+      --text: #eef3fb;
+      --muted: #8fa1bf;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --ok: #22c55e;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #172033 0%, var(--bg) 65%);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: rgba(59, 130, 246, 0.14);
+      padding: 6px 12px;
+      border-radius: 999px;
+      margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .subtitle {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.45;
+    }
+    .meta {
+      background: rgba(11, 15, 23, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      font-size: 14px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .meta-label { color: var(--muted); }
+    .meta-value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input {
+      width: 100%;
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(11, 15, 23, 0.8);
+      color: var(--text);
+      font-size: 16px;
+      margin-bottom: 16px;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .status {
+      min-height: 24px;
+      margin-bottom: 16px;
+      font-size: 14px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .status.ok { color: var(--ok); font-weight: 600; }
+    .status.err { color: var(--danger); font-weight: 600; }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 14px;
+      padding: 16px 18px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .done-icon {
+      font-size: 46px;
+      text-align: center;
+      margin-bottom: 10px;
+      color: var(--ok);
+    }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge">TailAuth • Device Setup</div>
+    <div id="doneIcon" class="done-icon hidden">✔</div>
+    <h1 id="title">Enroll Phone Fingerprint</h1>
+    <p class="subtitle" id="subtitle">Bind this phone's biometric passkey so you can approve sudo prompts.</p>
+
+    <div class="meta">
+      <span class="meta-label">Account</span>
+      <span class="meta-value" id="metaTarget">Loading…</span>
+    </div>
+
+    <div id="formArea">
+      <label for="labelInput">Device name</label>
+      <input id="labelInput" type="text" maxlength="64" placeholder="My Phone">
+      <div id="status" class="status">Tap below to create a hardware-backed passkey.</div>
+      <button id="enrollBtn" disabled>Register Phone Fingerprint</button>
+    </div>
+  </main>
+
+  <script>
+    const token = window.location.pathname.split("/").filter(Boolean).pop();
+    const metaTargetEl = document.getElementById("metaTarget");
+    const labelInput = document.getElementById("labelInput");
+    const enrollBtn = document.getElementById("enrollBtn");
+    const statusEl = document.getElementById("status");
+    const formAreaEl = document.getElementById("formArea");
+    const doneIconEl = document.getElementById("doneIcon");
+    const titleEl = document.getElementById("title");
+    const subtitleEl = document.getElementById("subtitle");
+
+    let enrollOptions = null;
+
+    function guessDeviceName() {
+      const ua = navigator.userAgent || "";
+      if (/iPhone/i.test(ua)) return "iPhone";
+      if (/iPad/i.test(ua)) return "iPad";
+      if (/Android/i.test(ua)) return "Android Phone";
+      return "Phone";
+    }
+
+    function b64urlToBuf(str) {
+      const pad = "=".repeat((4 - (str.length % 4)) % 4);
+      const b64 = (str + pad).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    function bufToB64url(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    }
+
+    function setStatus(msg, cls = "") {
+      statusEl.textContent = msg;
+      statusEl.className = "status" + (cls ? " " + cls : "");
+    }
+
+    async function init() {
+      labelInput.value = guessDeviceName();
+      try {
+        const resp = await fetch(`/api/enroll/${encodeURIComponent(token)}/options`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          setStatus(data.error || "Enrollment link expired or invalid.", "err");
+          return;
+        }
+        enrollOptions = data;
+        metaTargetEl.textContent = `${data.user}@${data.hostname}`;
+        enrollBtn.disabled = false;
+      } catch (err) {
+        setStatus(err.message || "Failed to contact TailAuth.", "err");
+      }
+    }
+
+    enrollBtn.addEventListener("click", async () => {
+      if (!enrollOptions) return;
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        setStatus("WebAuthn is not supported in this browser.", "err");
+        return;
+      }
+
+      enrollBtn.disabled = true;
+      setStatus("Confirm with your phone fingerprint…");
+
+      try {
+        const userIdBytes = new TextEncoder().encode(
+          `${enrollOptions.user}@${enrollOptions.hostname}`
+        );
+        const cred = await navigator.credentials.create({
+          publicKey: {
+            rp: {
+              id: enrollOptions.rp_id,
+              name: `TailAuth (${enrollOptions.hostname})`
+            },
+            user: {
+              id: userIdBytes,
+              name: `${enrollOptions.user}@${enrollOptions.hostname}`,
+              displayName: `${enrollOptions.user}@${enrollOptions.hostname}`
+            },
+            challenge: b64urlToBuf(enrollOptions.challenge),
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            timeout: 180000,
+            authenticatorSelection: {
+              authenticatorAttachment: "platform",
+              userVerification: "required",
+              residentKey: "preferred"
+            },
+            attestation: "none"
+          }
+        });
+
+        let publicKeySpki = null;
+        if (typeof cred.response.getPublicKey === "function") {
+          const spkiBuf = cred.response.getPublicKey();
+          if (spkiBuf) publicKeySpki = bufToB64url(spkiBuf);
+        }
+
+        const label = labelInput.value.trim() || guessDeviceName();
+        setStatus("Saving credential…");
+
+        const resp = await fetch(`/api/enroll/${encodeURIComponent(token)}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: cred.id,
+            clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+            attestationObject: bufToB64url(cred.response.attestationObject),
+            publicKeySpki,
+            label
+          })
+        });
+
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(body.error || `Enrollment failed (${resp.status})`);
+        }
+
+        formAreaEl.classList.add("hidden");
+        doneIconEl.classList.remove("hidden");
+        titleEl.textContent = "Phone Enrolled";
+        subtitleEl.textContent = `${label} is now authorized for ${enrollOptions.user}@${enrollOptions.hostname}. You can close this tab.`;
+      } catch (err) {
+        setStatus(err.message || "Enrollment cancelled or failed.", "err");
+        enrollBtn.disabled = false;
+      }
+    });
+
+    init();
+  </script>
+</body>
+</html>
