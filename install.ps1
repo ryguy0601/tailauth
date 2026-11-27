@@ -222,10 +222,12 @@ function sudo {
 }
 # tailauth-end
 "@
+    $docsDir = [Environment]::GetFolderPath("MyDocuments")
     $profileTargets = @(
-        (Join-Path $env:USERPROFILE "Documents\PowerShell\Microsoft.PowerShell_profile.ps1"),
-        (Join-Path $env:USERPROFILE "Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1")
-    ) | Select-Object -Unique
+        $PROFILE,
+        (Join-Path $docsDir "PowerShell\Microsoft.PowerShell_profile.ps1"),
+        (Join-Path $docsDir "WindowsPowerShell\Microsoft.PowerShell_profile.ps1")
+    ) | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
 
     foreach ($prof in $profileTargets) {
         $profDir = Split-Path -Parent $prof

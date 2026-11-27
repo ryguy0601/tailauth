@@ -1138,9 +1138,39 @@ fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+fn is_windows_sudo_enabled() -> bool {
+    let Ok(output) = Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo",
+            "/v",
+            "Enabled",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if line.contains("Enabled") {
+            if let Some(val) = line.split_whitespace().last() {
+                let hex = val.trim_start_matches("0x").trim_start_matches("0X");
+                if let Ok(num) = u32::from_str_radix(hex, 16) {
+                    return num != 0;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn fallback_uac(command: &[String]) -> i32 {
     let win_sudo = Path::new(r"C:\Windows\System32\sudo.exe");
-    if win_sudo.exists() {
+    if win_sudo.exists() && is_windows_sudo_enabled() {
         if let Ok(status) = Command::new(win_sudo).args(command).status() {
             return status.code().unwrap_or(1);
         }
