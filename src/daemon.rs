@@ -519,13 +519,10 @@ async fn send_event<W: AsyncWriteExt + Unpin>(writer: &mut W, event: &ServerEven
     writer.flush().await
 }
 
-async fn read_until_eof<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
+async fn read_until_cancel_or_eof<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
     let mut buf = [0u8; 64];
-    loop {
-        match tokio::io::AsyncReadExt::read(reader, &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => continue,
-        }
+    match tokio::io::AsyncReadExt::read(reader, &mut buf).await {
+        Ok(0) | Ok(_) | Err(_) => {}
     }
 }
 
@@ -649,7 +646,7 @@ where
                     state.auth_sessions.lock().await.remove(&token);
                     AuthOutcome::Timeout
                 }
-                _ = read_until_eof(&mut reader) => {
+                _ = read_until_cancel_or_eof(&mut reader) => {
                     state.auth_sessions.lock().await.remove(&token);
                     eprintln!("tailauth: auth cancelled by client for '{target_user}'");
                     return;
@@ -733,7 +730,7 @@ where
                     state.enroll_sessions.lock().await.remove(&token);
                     EnrollOutcome::Timeout
                 }
-                _ = read_until_eof(&mut reader) => {
+                _ = read_until_cancel_or_eof(&mut reader) => {
                     state.enroll_sessions.lock().await.remove(&token);
                     eprintln!("tailauth: enrollment cancelled by client for '{user}'");
                     return;
@@ -946,7 +943,7 @@ where
                         state.auth_sessions.lock().await.remove(&token);
                         AuthOutcome::Timeout
                     }
-                    _ = read_until_eof(&mut reader) => {
+                    _ = read_until_cancel_or_eof(&mut reader) => {
                         state.auth_sessions.lock().await.remove(&token);
                         eprintln!("tailauth: elevation cancelled by client for '{target_user}'");
                         return;

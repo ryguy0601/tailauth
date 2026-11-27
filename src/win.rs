@@ -7,8 +7,8 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::io::FromRawHandle;
-use std::path::Path;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -30,9 +30,9 @@ use windows_sys::Win32::Security::{
     TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_LINKED_TOKEN, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+    FlushConsoleInputBuffer, GetConsoleMode, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, INPUT_RECORD, KEY_EVENT, STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId, WaitNamedPipeW};
 use windows_sys::Win32::System::Services::{
@@ -637,9 +637,8 @@ pub fn run_windows_service(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-fn enable_vt_output() {
+fn enable_vt_on_handle(handle: HANDLE) {
     unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return;
         }
@@ -650,11 +649,43 @@ fn enable_vt_output() {
     }
 }
 
-fn clear_stdout_lines(lines: usize) {
-    if lines > 0 {
-        let mut out = io::stdout();
-        let _ = write!(out, "\r\x1b[{lines}A\x1b[J");
-        let _ = out.flush();
+fn enable_vt_output() {
+    unsafe {
+        enable_vt_on_handle(GetStdHandle(STD_OUTPUT_HANDLE));
+        enable_vt_on_handle(GetStdHandle(STD_ERROR_HANDLE));
+    }
+}
+
+struct ConsoleOut {
+    conout: Option<File>,
+}
+
+impl ConsoleOut {
+    fn open() -> Self {
+        enable_vt_output();
+        let conout = OpenOptions::new().read(true).write(true).open("CONOUT$").ok();
+        if let Some(ref f) = conout {
+            enable_vt_on_handle(f.as_raw_handle() as HANDLE);
+        }
+        Self { conout }
+    }
+
+    fn write_str(&mut self, s: &str) {
+        if let Some(ref mut f) = self.conout {
+            let _ = f.write_all(s.as_bytes());
+            let _ = f.flush();
+        } else {
+            let mut err = io::stderr();
+            let _ = err.write_all(s.as_bytes());
+            let _ = err.flush();
+        }
+    }
+
+    fn clear_lines(&mut self, lines: usize) {
+        if lines > 0 {
+            let seq = format!("\r\x1b[{lines}A\x1b[J");
+            self.write_str(&seq);
+        }
     }
 }
 
@@ -808,12 +839,20 @@ enum SudoMsg {
 
 fn spawn_console_key_watcher(tx: mpsc::Sender<SudoMsg>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || unsafe {
-        let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
-        if stdin_handle.is_null() || stdin_handle == INVALID_HANDLE_VALUE {
+        let conin_file = OpenOptions::new().read(true).write(true).open("CONIN$").ok();
+        let conin_handle = match conin_file {
+            Some(ref f) => f.as_raw_handle() as HANDLE,
+            None => GetStdHandle(STD_INPUT_HANDLE),
+        };
+        if conin_handle.is_null() || conin_handle == INVALID_HANDLE_VALUE {
             return;
         }
+
+        // Discard any stale key-up events (e.g., Enter from launching the command).
+        FlushConsoleInputBuffer(conin_handle);
+
         while !stop.load(Ordering::Relaxed) {
-            let wait = WaitForSingleObject(stdin_handle, 200);
+            let wait = WaitForSingleObject(conin_handle, 200);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -822,22 +861,22 @@ fn spawn_console_key_watcher(tx: mpsc::Sender<SudoMsg>, stop: Arc<AtomicBool>) {
             }
             let mut rec: INPUT_RECORD = std::mem::zeroed();
             let mut read_count: u32 = 0;
-            if ReadConsoleInputW(stdin_handle, &mut rec, 1, &mut read_count) == 0
+            if ReadConsoleInputW(conin_handle, &mut rec, 1, &mut read_count) == 0
                 || read_count == 0
             {
                 break;
             }
             if rec.EventType as u32 == KEY_EVENT && rec.Event.KeyEvent.bKeyDown != 0 {
                 let ch = rec.Event.KeyEvent.uChar.UnicodeChar;
-                if ch == 0x03 {
+                let vk = rec.Event.KeyEvent.wVirtualKeyCode;
+                let ctrl = (rec.Event.KeyEvent.dwControlKeyState & (0x0004 | 0x0008)) != 0;
+                if ch == 0x03 || (vk == 0x43 && ctrl) {
                     let _ = tx.send(SudoMsg::KeyCancel);
                     break;
                 }
-                if matches!(ch, 0x0d | 0x0a | 0x1b)
-                    || ch == (b'p' as u16)
-                    || ch == (b'P' as u16)
-                    || ch == (b'q' as u16)
-                    || ch == (b'Q' as u16)
+                if vk == 0x1B
+                    || vk == 0x0D
+                    || matches!(ch, 0x0d | 0x0a | 0x1b | 0x70 | 0x50 | 0x71 | 0x51)
                 {
                     let _ = tx.send(SudoMsg::KeyFallback);
                     break;
@@ -847,9 +886,15 @@ fn spawn_console_key_watcher(tx: mpsc::Sender<SudoMsg>, stop: Arc<AtomicBool>) {
     });
 }
 
+fn send_cancel_and_close(mut pipe_write: File) {
+    let _ = pipe_write.write_all(b"cancel\n");
+    let _ = pipe_write.flush();
+    drop(pipe_write);
+}
+
 /// Interactive QR approval test on Windows without running an elevated command.
 pub fn run_windows_test(config: &Config, user: String) -> i32 {
-    enable_vt_output();
+    let mut con = ConsoleOut::open();
     let mut write_file = match open_pipe_client(&config.socket_path) {
         Ok(f) => f,
         Err(e) => {
@@ -903,13 +948,10 @@ pub fn run_windows_test(config: &Config, user: String) -> i32 {
         return 1;
     };
 
-    println!();
-    println!(
-        "\x1b[1;34mTailAuth\x1b[0m — scan with your phone to test \x1b[1m{user}\x1b[0m ({timeout_secs}s timeout):"
-    );
-    print!("{}", rendered.text);
-    println!("\x1b[2mLink: {url}");
-    println!("Press Enter (or 'p' / Esc) to cancel...\x1b[0m");
+    con.write_str(&format!(
+        "\n\x1b[1;34mTailAuth\x1b[0m — scan with your phone to test \x1b[1m{user}\x1b[0m ({timeout_secs}s timeout):\n{}\x1b[2mLink: {url}\nPress Enter (or 'p' / Esc) to cancel...\x1b[0m\n",
+        rendered.text
+    ));
     let total_lines = 2 + rendered.line_count + 2;
 
     let (tx, rx) = mpsc::channel();
@@ -935,34 +977,34 @@ pub fn run_windows_test(config: &Config, user: String) -> i32 {
     match rx.recv() {
         Ok(SudoMsg::Event(ServerEvent::Approved { label, .. })) => {
             stop_keys.store(true, Ordering::Relaxed);
-            clear_stdout_lines(total_lines);
-            println!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m");
+            con.clear_lines(total_lines);
+            con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
             0
         }
         Ok(SudoMsg::Event(ServerEvent::Denied)) => {
             stop_keys.store(true, Ordering::Relaxed);
-            clear_stdout_lines(total_lines);
-            println!("\x1b[31m✖ TailAuth: Denied on phone.\x1b[0m");
+            con.clear_lines(total_lines);
+            con.write_str("\x1b[31m✖ TailAuth: Denied on phone.\x1b[0m\n");
             1
         }
         Ok(SudoMsg::Event(ServerEvent::Timeout)) => {
             stop_keys.store(true, Ordering::Relaxed);
-            clear_stdout_lines(total_lines);
-            println!("\x1b[33m⏱ TailAuth: Timed out.\x1b[0m");
+            con.clear_lines(total_lines);
+            con.write_str("\x1b[33m⏱ TailAuth: Timed out.\x1b[0m\n");
             1
         }
         Ok(SudoMsg::KeyCancel) => {
             stop_keys.store(true, Ordering::Relaxed);
-            drop(write_file);
-            clear_stdout_lines(total_lines);
-            println!("TailAuth: Cancelled.");
+            send_cancel_and_close(write_file);
+            con.clear_lines(total_lines);
+            con.write_str("TailAuth: Cancelled.\n");
             130
         }
         _ => {
             stop_keys.store(true, Ordering::Relaxed);
-            drop(write_file);
-            clear_stdout_lines(total_lines);
-            println!("TailAuth: Cancelled.");
+            send_cancel_and_close(write_file);
+            con.clear_lines(total_lines);
+            con.write_str("TailAuth: Cancelled.\n");
             1
         }
     }
@@ -976,7 +1018,7 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
         return 2;
     }
 
-    enable_vt_output();
+    let mut con = ConsoleOut::open();
 
     let mut write_file = match open_pipe_client(&config.socket_path) {
         Ok(f) => f,
@@ -1022,13 +1064,10 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
         return fallback_uac(&command);
     };
 
-    println!();
-    println!(
-        "\x1b[1;34mTailAuth\x1b[0m — scan with your phone to elevate ({timeout_secs}s timeout):"
-    );
-    print!("{}", rendered.text);
-    println!("\x1b[2mLink: {url}");
-    println!("Press Enter (or 'p' / Esc) for Windows UAC / password...\x1b[0m");
+    con.write_str(&format!(
+        "\n\x1b[1;34mTailAuth\x1b[0m — scan with your phone to elevate ({timeout_secs}s timeout):\n{}\x1b[2mLink: {url}\nPress Enter (or 'p' / Esc) for Windows UAC / password...\x1b[0m\n",
+        rendered.text
+    ));
     let total_lines = 2 + rendered.line_count + 2;
 
     let (tx, rx) = mpsc::channel();
@@ -1067,23 +1106,23 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
         match rx.recv() {
             Ok(SudoMsg::KeyCancel) if !approved => {
                 stop_keys.store(true, Ordering::Relaxed);
-                drop(write_file);
-                clear_stdout_lines(total_lines);
-                println!("TailAuth: Cancelled.");
+                send_cancel_and_close(write_file);
+                con.clear_lines(total_lines);
+                con.write_str("TailAuth: Cancelled.\n");
                 return 130;
             }
             Ok(SudoMsg::KeyFallback) if !approved => {
                 stop_keys.store(true, Ordering::Relaxed);
-                drop(write_file);
-                clear_stdout_lines(total_lines);
-                println!("TailAuth: Falling back to Windows UAC.");
+                send_cancel_and_close(write_file);
+                con.clear_lines(total_lines);
+                con.write_str("TailAuth: Falling back to Windows UAC...\n");
                 return fallback_uac(&command);
             }
             Ok(SudoMsg::Event(ServerEvent::Approved { label, .. })) => {
                 approved = true;
                 stop_keys.store(true, Ordering::Relaxed);
-                clear_stdout_lines(total_lines);
-                println!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m");
+                con.clear_lines(total_lines);
+                con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
             }
             Ok(SudoMsg::Event(ServerEvent::Output { stream, data_b64 })) => {
                 if let Ok(bytes) = b64url_decode(&data_b64) {
@@ -1103,20 +1142,20 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
             }
             Ok(SudoMsg::Event(ServerEvent::Denied)) => {
                 stop_keys.store(true, Ordering::Relaxed);
-                clear_stdout_lines(total_lines);
-                println!("\x1b[31m✖ TailAuth: Denied on phone — falling back to Windows UAC.\x1b[0m");
+                con.clear_lines(total_lines);
+                con.write_str("\x1b[31m✖ TailAuth: Denied on phone — falling back to Windows UAC.\x1b[0m\n");
                 return fallback_uac(&command);
             }
             Ok(SudoMsg::Event(ServerEvent::Timeout)) => {
                 stop_keys.store(true, Ordering::Relaxed);
-                clear_stdout_lines(total_lines);
-                println!("\x1b[33m⏱ TailAuth: Timed out — falling back to Windows UAC.\x1b[0m");
+                con.clear_lines(total_lines);
+                con.write_str("\x1b[33m⏱ TailAuth: Timed out — falling back to Windows UAC.\x1b[0m\n");
                 return fallback_uac(&command);
             }
             Ok(SudoMsg::Event(ServerEvent::Error { message })) => {
                 stop_keys.store(true, Ordering::Relaxed);
                 if !approved {
-                    clear_stdout_lines(total_lines);
+                    con.clear_lines(total_lines);
                 }
                 eprintln!("tailauth: {message}");
                 return if approved { 1 } else { fallback_uac(&command) };
@@ -1124,7 +1163,7 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
             Ok(SudoMsg::Eof) | Err(_) => {
                 stop_keys.store(true, Ordering::Relaxed);
                 if !approved {
-                    clear_stdout_lines(total_lines);
+                    con.clear_lines(total_lines);
                     return fallback_uac(&command);
                 }
                 return 1;
@@ -1136,6 +1175,13 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
 
 fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+struct TempPathGuard(PathBuf);
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn is_windows_sudo_enabled() -> bool {
@@ -1176,35 +1222,46 @@ fn fallback_uac(command: &[String]) -> i32 {
         }
     }
 
-    let file = &command[0];
-    let args_joined = if command.len() > 1 {
-        command[1..]
-            .iter()
-            .map(|a| quote_windows_arg(a))
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        String::new()
-    };
+    let pid = std::process::id();
+    let out_guard = TempPathGuard(env::temp_dir().join(format!("tailauth_uac_out_{pid}.tmp")));
+    let err_guard = TempPathGuard(env::temp_dir().join(format!("tailauth_uac_err_{pid}.tmp")));
+    let out_str = out_guard.0.to_string_lossy().into_owned();
+    let err_str = err_guard.0.to_string_lossy().into_owned();
 
-    let ps_script = if args_joined.is_empty() {
-        format!(
-            "$p = Start-Process -FilePath {} -Verb RunAs -PassThru -Wait; exit $p.ExitCode",
-            ps_single_quote(file)
-        )
-    } else {
-        format!(
-            "$p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -PassThru -Wait; exit $p.ExitCode",
-            ps_single_quote(file),
-            ps_single_quote(&args_joined)
-        )
-    };
+    let cmd_inner = build_windows_command_line(command);
+    let cmd_args = format!(
+        "/D /C \"{} > {} 2> {}\"",
+        cmd_inner,
+        quote_windows_arg(&out_str),
+        quote_windows_arg(&err_str)
+    );
 
-    match Command::new("powershell.exe")
+    let ps_script = format!(
+        "try {{ $p = Start-Process -FilePath 'cmd.exe' -ArgumentList {} -Verb RunAs -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode }} catch {{ exit 1223 }}",
+        ps_single_quote(&cmd_args)
+    );
+
+    let status = Command::new("powershell.exe")
         .args(["-NoProfile", "-Command", &ps_script])
-        .status()
-    {
-        Ok(status) => status.code().unwrap_or(1),
+        .status();
+
+    if let Ok(bytes) = std::fs::read(&out_guard.0) {
+        if !bytes.is_empty() {
+            let mut out = io::stdout();
+            let _ = out.write_all(&bytes);
+            let _ = out.flush();
+        }
+    }
+    if let Ok(bytes) = std::fs::read(&err_guard.0) {
+        if !bytes.is_empty() {
+            let mut err = io::stderr();
+            let _ = err.write_all(&bytes);
+            let _ = err.flush();
+        }
+    }
+
+    match status {
+        Ok(st) => st.code().unwrap_or(1),
         Err(e) => {
             eprintln!("tailauth: fallback UAC failed: {e}");
             1
