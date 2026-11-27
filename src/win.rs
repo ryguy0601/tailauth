@@ -11,8 +11,10 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
@@ -855,11 +857,9 @@ pub fn run_windows_enroll(config: &Config, user: String) -> i32 {
     }
 }
 
-enum SudoMsg {
-    Event(ServerEvent),
-    Eof,
-    KeyFallback,
-    KeyCancel,
+enum KeyAction {
+    Fallback,
+    Cancel,
 }
 
 struct ConInModeGuard {
@@ -888,7 +888,7 @@ impl Drop for ConInModeGuard {
 }
 
 fn spawn_console_key_watcher(
-    tx: mpsc::Sender<SudoMsg>,
+    tx: tokio_mpsc::UnboundedSender<KeyAction>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || unsafe {
@@ -907,7 +907,7 @@ fn spawn_console_key_watcher(
         FlushConsoleInputBuffer(conin_handle);
 
         while !stop.load(Ordering::Relaxed) {
-            let wait = WaitForSingleObject(conin_handle, 200);
+            let wait = WaitForSingleObject(conin_handle, 50);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -926,14 +926,16 @@ fn spawn_console_key_watcher(
                 let vk = rec.Event.KeyEvent.wVirtualKeyCode;
                 let ctrl = (rec.Event.KeyEvent.dwControlKeyState & (0x0004 | 0x0008)) != 0;
                 if ch == 0x03 || (vk == 0x43 && ctrl) {
-                    let _ = tx.send(SudoMsg::KeyCancel);
+                    let _ = tx.send(KeyAction::Cancel);
                     break;
                 }
                 if vk == 0x1B
                     || vk == 0x0D
+                    || vk == 0x50
+                    || vk == 0x51
                     || matches!(ch, 0x0d | 0x0a | 0x1b | 0x70 | 0x50 | 0x71 | 0x51)
                 {
-                    let _ = tx.send(SudoMsg::KeyFallback);
+                    let _ = tx.send(KeyAction::Fallback);
                     break;
                 }
             }
@@ -941,45 +943,70 @@ fn spawn_console_key_watcher(
     })
 }
 
-fn send_cancel_and_close(mut pipe_write: File) {
-    let _ = pipe_write.write_all(b"cancel\n");
-    let _ = pipe_write.flush();
-    drop(pipe_write);
+async fn connect_pipe_async(pipe_name: &str) -> io::Result<NamedPipeClient> {
+    for _ in 0..20 {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    ClientOptions::new().open(pipe_name)
+}
+
+async fn send_async_cancel<W: AsyncWriteExt + Unpin>(mut write_half: W) {
+    let _ = tokio::time::timeout(Duration::from_millis(200), write_half.write_all(b"cancel\n")).await;
+    let _ = tokio::time::timeout(Duration::from_millis(100), write_half.flush()).await;
+    drop(write_half);
+}
+
+fn stop_key_watcher(stop: &Arc<AtomicBool>, handle: &mut Option<std::thread::JoinHandle<()>>) {
+    stop.store(true, Ordering::Relaxed);
+    if let Some(h) = handle.take() {
+        let _ = h.join();
+    }
 }
 
 /// Interactive QR approval test on Windows without running an elevated command.
 pub fn run_windows_test(config: &Config, user: String) -> i32 {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("tailauth: failed to create async runtime");
+        return 1;
+    };
+    rt.block_on(run_windows_test_async(config, user))
+}
+
+async fn run_windows_test_async(config: &Config, user: String) -> i32 {
     let mut con = ConsoleOut::open();
-    let mut write_file = match open_pipe_client(&config.socket_path) {
-        Ok(f) => f,
+    let client = match connect_pipe_async(&config.socket_path).await {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("tailauth: {e}");
+            eprintln!("tailauth: failed to connect to service ({e})");
             return 1;
         }
     };
-    let read_file = match write_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("tailauth: pipe clone failed: {e}");
-            return 1;
-        }
-    };
+    let (read_half, mut write_half) = tokio::io::split(client);
 
     let req = ClientRequest::StartAuth {
         user: user.clone(),
         ruser: None,
         service: Some("windows-test".to_string()),
     };
-    let mut line = serde_json::to_string(&req).unwrap();
-    line.push('\n');
-    if write_file.write_all(line.as_bytes()).is_err() || write_file.flush().is_err() {
+    let mut req_line = serde_json::to_string(&req).unwrap();
+    req_line.push('\n');
+    if write_half.write_all(req_line.as_bytes()).await.is_err() || write_half.flush().await.is_err() {
         eprintln!("tailauth: failed to send request");
         return 1;
     }
 
-    let mut reader = BufReader::new(read_file);
+    let mut reader = TokioBufReader::new(read_half);
     let mut resp = String::new();
-    if reader.read_line(&mut resp).is_err() || resp.is_empty() {
+    if reader.read_line(&mut resp).await.is_err() || resp.is_empty() {
         eprintln!("tailauth: no response from service");
         return 1;
     }
@@ -1009,57 +1036,56 @@ pub fn run_windows_test(config: &Config, user: String) -> i32 {
     ));
     let total_lines = 2 + rendered.line_count + 2;
 
-    let (tx, rx) = mpsc::channel();
+    let (key_tx, mut key_rx) = tokio_mpsc::unbounded_channel();
     let stop_keys = Arc::new(AtomicBool::new(false));
-    let key_thread = spawn_console_key_watcher(tx.clone(), Arc::clone(&stop_keys));
+    let mut key_thread = Some(spawn_console_key_watcher(key_tx, Arc::clone(&stop_keys)));
 
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                let _ = tx.send(SudoMsg::Eof);
-            }
-            Ok(_) => {
-                if let Ok(ev) = serde_json::from_str::<ServerEvent>(line.trim()) {
-                    let _ = tx.send(SudoMsg::Event(ev));
-                } else {
-                    let _ = tx.send(SudoMsg::Eof);
+    resp.clear();
+    let code = tokio::select! {
+        read_res = reader.read_line(&mut resp) => {
+            stop_key_watcher(&stop_keys, &mut key_thread);
+            match read_res {
+                Ok(0) | Err(_) => {
+                    con.clear_lines(total_lines);
+                    con.write_str("TailAuth: Cancelled.\n");
+                    1
+                }
+                Ok(_) => match serde_json::from_str::<ServerEvent>(resp.trim()) {
+                    Ok(ServerEvent::Approved { label, .. }) => {
+                        con.clear_lines(total_lines);
+                        con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
+                        0
+                    }
+                    Ok(ServerEvent::Denied) => {
+                        con.clear_lines(total_lines);
+                        con.write_str("\x1b[31m✖ TailAuth: Denied on phone.\x1b[0m\n");
+                        1
+                    }
+                    Ok(ServerEvent::Timeout) => {
+                        con.clear_lines(total_lines);
+                        con.write_str("\x1b[33m⏱ TailAuth: Timed out.\x1b[0m\n");
+                        1
+                    }
+                    _ => {
+                        con.clear_lines(total_lines);
+                        con.write_str("TailAuth: Cancelled.\n");
+                        1
+                    }
                 }
             }
         }
-    });
-
-    let code = match rx.recv() {
-        Ok(SudoMsg::Event(ServerEvent::Approved { label, .. })) => {
-            con.clear_lines(total_lines);
-            con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
-            0
-        }
-        Ok(SudoMsg::Event(ServerEvent::Denied)) => {
-            con.clear_lines(total_lines);
-            con.write_str("\x1b[31m✖ TailAuth: Denied on phone.\x1b[0m\n");
-            1
-        }
-        Ok(SudoMsg::Event(ServerEvent::Timeout)) => {
-            con.clear_lines(total_lines);
-            con.write_str("\x1b[33m⏱ TailAuth: Timed out.\x1b[0m\n");
-            1
-        }
-        Ok(SudoMsg::KeyCancel) => {
-            send_cancel_and_close(write_file);
+        action = key_rx.recv() => {
+            stop_key_watcher(&stop_keys, &mut key_thread);
+            drop(reader);
+            send_async_cancel(write_half).await;
             con.clear_lines(total_lines);
             con.write_str("TailAuth: Cancelled.\n");
-            130
-        }
-        _ => {
-            send_cancel_and_close(write_file);
-            con.clear_lines(total_lines);
-            con.write_str("TailAuth: Cancelled.\n");
-            1
+            match action {
+                Some(KeyAction::Cancel) => 130,
+                _ => 1,
+            }
         }
     };
-    stop_keys.store(true, Ordering::Relaxed);
-    let _ = key_thread.join();
     code
 }
 
@@ -1071,16 +1097,23 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
         return 2;
     }
 
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return fallback_uac(&command);
+    };
+    rt.block_on(run_windows_sudo_async(config, command))
+}
+
+async fn run_windows_sudo_async(config: &Config, command: Vec<String>) -> i32 {
     let mut con = ConsoleOut::open();
 
-    let mut write_file = match open_pipe_client(&config.socket_path) {
-        Ok(f) => f,
+    let client = match connect_pipe_async(&config.socket_path).await {
+        Ok(c) => c,
         Err(_) => return fallback_uac(&command),
     };
-    let read_file = match write_file.try_clone() {
-        Ok(f) => f,
-        Err(_) => return fallback_uac(&command),
-    };
+    let (read_half, mut write_half) = tokio::io::split(client);
 
     let cwd = env::current_dir()
         .ok()
@@ -1093,17 +1126,17 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
         return fallback_uac(&command);
     };
     req_line.push('\n');
-    if write_file.write_all(req_line.as_bytes()).is_err() || write_file.flush().is_err() {
+    if write_half.write_all(req_line.as_bytes()).await.is_err() || write_half.flush().await.is_err() {
         return fallback_uac(&command);
     }
 
-    let mut reader = BufReader::new(read_file);
-    let mut initial_line = String::new();
-    if reader.read_line(&mut initial_line).is_err() || initial_line.is_empty() {
+    let mut reader = TokioBufReader::new(read_half);
+    let mut line = String::new();
+    if reader.read_line(&mut line).await.is_err() || line.is_empty() {
         return fallback_uac(&command);
     }
 
-    let (url, timeout_secs) = match serde_json::from_str::<ServerEvent>(initial_line.trim()) {
+    let (url, timeout_secs) = match serde_json::from_str::<ServerEvent>(line.trim()) {
         Ok(ServerEvent::Pending {
             url, timeout_secs, ..
         }) => (url, timeout_secs),
@@ -1123,113 +1156,94 @@ pub fn run_windows_sudo(config: &Config, command: Vec<String>) -> i32 {
     ));
     let total_lines = 2 + rendered.line_count + 2;
 
-    let (tx, rx) = mpsc::channel();
+    let (key_tx, mut key_rx) = tokio_mpsc::unbounded_channel();
     let stop_keys = Arc::new(AtomicBool::new(false));
-    let mut key_thread = Some(spawn_console_key_watcher(tx.clone(), Arc::clone(&stop_keys)));
-
-    let stop_watcher = |stop: &Arc<AtomicBool>, handle: &mut Option<std::thread::JoinHandle<()>>| {
-        stop.store(true, Ordering::Relaxed);
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
-    };
-
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(SudoMsg::Eof);
-                    break;
-                }
-                Ok(_) => {
-                    if let Ok(ev) = serde_json::from_str::<ServerEvent>(line.trim()) {
-                        let done = matches!(
-                            ev,
-                            ServerEvent::Denied
-                                | ServerEvent::Timeout
-                                | ServerEvent::Exited { .. }
-                                | ServerEvent::Error { .. }
-                        );
-                        if tx.send(SudoMsg::Event(ev)).is_err() || done {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let mut key_thread = Some(spawn_console_key_watcher(key_tx, Arc::clone(&stop_keys)));
 
     let mut approved = false;
+    let pending_key: Option<KeyAction>;
+
     loop {
-        match rx.recv() {
-            Ok(SudoMsg::KeyCancel) if !approved => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                send_cancel_and_close(write_file);
-                con.clear_lines(total_lines);
-                con.write_str("TailAuth: Cancelled.\n");
-                return 130;
-            }
-            Ok(SudoMsg::KeyFallback) if !approved => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                send_cancel_and_close(write_file);
-                con.clear_lines(total_lines);
-                con.write_str("TailAuth: Falling back to Windows UAC...\n");
-                return fallback_uac(&command);
-            }
-            Ok(SudoMsg::Event(ServerEvent::Approved { label, .. })) => {
-                approved = true;
-                stop_watcher(&stop_keys, &mut key_thread);
-                con.clear_lines(total_lines);
-                con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
-            }
-            Ok(SudoMsg::Event(ServerEvent::Output { stream, data_b64 })) => {
-                if let Ok(bytes) = b64url_decode(&data_b64) {
-                    if stream == "stderr" {
-                        let mut err = io::stderr();
-                        let _ = err.write_all(&bytes);
-                        let _ = err.flush();
-                    } else {
-                        let mut out = io::stdout();
-                        let _ = out.write_all(&bytes);
-                        let _ = out.flush();
+        line.clear();
+        tokio::select! {
+            read_res = reader.read_line(&mut line) => {
+                match read_res {
+                    Ok(0) | Err(_) => {
+                        stop_key_watcher(&stop_keys, &mut key_thread);
+                        if !approved {
+                            con.clear_lines(total_lines);
+                            return fallback_uac(&command);
+                        }
+                        return 1;
+                    }
+                    Ok(_) => match serde_json::from_str::<ServerEvent>(line.trim()) {
+                        Ok(ServerEvent::Approved { label, .. }) => {
+                            approved = true;
+                            stop_key_watcher(&stop_keys, &mut key_thread);
+                            con.clear_lines(total_lines);
+                            con.write_str(&format!("\x1b[32m✔ TailAuth: Approved via {label}\x1b[0m\n"));
+                        }
+                        Ok(ServerEvent::Output { stream, data_b64 }) => {
+                            if let Ok(bytes) = b64url_decode(&data_b64) {
+                                if stream == "stderr" {
+                                    let mut err = io::stderr();
+                                    let _ = err.write_all(&bytes);
+                                    let _ = err.flush();
+                                } else {
+                                    let mut out = io::stdout();
+                                    let _ = out.write_all(&bytes);
+                                    let _ = out.flush();
+                                }
+                            }
+                        }
+                        Ok(ServerEvent::Exited { code }) => {
+                            stop_key_watcher(&stop_keys, &mut key_thread);
+                            return code;
+                        }
+                        Ok(ServerEvent::Denied) => {
+                            stop_key_watcher(&stop_keys, &mut key_thread);
+                            con.clear_lines(total_lines);
+                            con.write_str("\x1b[31m✖ TailAuth: Denied on phone — falling back to Windows UAC.\x1b[0m\n");
+                            return fallback_uac(&command);
+                        }
+                        Ok(ServerEvent::Timeout) => {
+                            stop_key_watcher(&stop_keys, &mut key_thread);
+                            con.clear_lines(total_lines);
+                            con.write_str("\x1b[33m⏱ TailAuth: Timed out — falling back to Windows UAC.\x1b[0m\n");
+                            return fallback_uac(&command);
+                        }
+                        Ok(ServerEvent::Error { message }) => {
+                            stop_key_watcher(&stop_keys, &mut key_thread);
+                            if !approved {
+                                con.clear_lines(total_lines);
+                            }
+                            eprintln!("tailauth: {message}");
+                            return if approved { 1 } else { fallback_uac(&command) };
+                        }
+                        _ => {}
                     }
                 }
             }
-            Ok(SudoMsg::Event(ServerEvent::Exited { code })) => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                return code;
+            Some(action) = key_rx.recv(), if !approved => {
+                pending_key = Some(action);
+                break;
             }
-            Ok(SudoMsg::Event(ServerEvent::Denied)) => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                con.clear_lines(total_lines);
-                con.write_str("\x1b[31m✖ TailAuth: Denied on phone — falling back to Windows UAC.\x1b[0m\n");
-                return fallback_uac(&command);
-            }
-            Ok(SudoMsg::Event(ServerEvent::Timeout)) => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                con.clear_lines(total_lines);
-                con.write_str("\x1b[33m⏱ TailAuth: Timed out — falling back to Windows UAC.\x1b[0m\n");
-                return fallback_uac(&command);
-            }
-            Ok(SudoMsg::Event(ServerEvent::Error { message })) => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                if !approved {
-                    con.clear_lines(total_lines);
-                }
-                eprintln!("tailauth: {message}");
-                return if approved { 1 } else { fallback_uac(&command) };
-            }
-            Ok(SudoMsg::Eof) | Err(_) => {
-                stop_watcher(&stop_keys, &mut key_thread);
-                if !approved {
-                    con.clear_lines(total_lines);
-                    return fallback_uac(&command);
-                }
-                return 1;
-            }
-            _ => {}
+        }
+    }
+
+    stop_key_watcher(&stop_keys, &mut key_thread);
+    drop(reader);
+    send_async_cancel(write_half).await;
+    con.clear_lines(total_lines);
+
+    match pending_key {
+        Some(KeyAction::Cancel) => {
+            con.write_str("TailAuth: Cancelled.\n");
+            130
+        }
+        _ => {
+            con.write_str("TailAuth: Falling back to Windows UAC...\n");
+            fallback_uac(&command)
         }
     }
 }
